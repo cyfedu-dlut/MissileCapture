@@ -353,7 +353,7 @@ class MissileStrikeAnalyzer:    #导弹打击分析主类（重要参数:video_p
         self.prev_gray = gray.copy()
         return frame
 
-    def detect_missile(self, frame, fg_mask):
+    # def detect_missile(self, frame, fg_mask):
         if self.impact_detected and self.impact_frame_count < self.cooldown_frames:
             self.impact_frame_count += 1
             self.missile_bbox = None
@@ -432,7 +432,70 @@ class MissileStrikeAnalyzer:    #导弹打击分析主类（重要参数:video_p
         self.prev_gray = gray.copy()
 
         return frame
-    
+    def detect_missile(self, frame, fg_mask):
+        # 冷却期内不检测导弹
+        if self.impact_detected and self.impact_frame_count < self.cooldown_frames:
+            self.impact_frame_count += 1
+            self.missile_bbox = None
+            return frame
+
+        # 灰度图转换（光流用）
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # 前景掩膜二值化 + 形态学处理
+        _, moving_mask = cv2.threshold(fg_mask, 127, 255, cv2.THRESH_BINARY)
+        kernel_size = max(3, frame.shape[1] // 200)
+        kernel = np.ones((kernel_size, kernel_size), np.uint8)
+        moving_mask = cv2.morphologyEx(moving_mask, cv2.MORPH_OPEN, kernel)
+        moving_mask = cv2.morphologyEx(moving_mask, cv2.MORPH_CLOSE, kernel)
+
+        # 查找前景轮廓
+        contours, _ = cv2.findContours(moving_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        self.missile_bbox = None
+        candidates = []
+
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            x, y, w, h = cv2.boundingRect(contour)
+            if w == 0 or h == 0:
+                continue
+            aspect_ratio = max(w, h) / min(w, h)
+            if 100 < area < 100000 and aspect_ratio > 2.0:
+                candidates.append((contour, area))
+
+        if candidates:
+            # 选择面积最大的轮廓作为导弹
+            best_contour = max(candidates, key=lambda x: x[1])[0]
+            x, y, w, h = cv2.boundingRect(best_contour)
+            center = (x + w // 2, y + h // 2)
+            self.missile_bbox = (x, y, w, h)
+            self.missile_trajectory.append(center)
+
+            if not self.missile_detected:
+                self.missile_detected = True
+                self.key_frames["missile_appearance"] = frame.copy()
+                self.key_frames_time["missile_appearance"] = self.frame_counter / self.fps
+
+        # 光流初始化与更新（不绘制线条）
+        if self.prev_gray is None:
+            self.prev_gray = gray.copy()
+
+        if self.prev_points is not None and len(self.prev_points) > 0:
+            next_points, status, _ = cv2.calcOpticalFlowPyrLK(
+                self.prev_gray, gray, self.prev_points, None, **self.lk_params)
+            if next_points is not None:
+                good_next = next_points[status == 1]
+                if len(good_next) >= 5:
+                    self.prev_points = good_next.reshape(-1, 1, 2)
+                else:
+                    self.prev_points = cv2.goodFeaturesToTrack(gray, mask=moving_mask, **self.feature_params)
+        else:
+            self.prev_points = cv2.goodFeaturesToTrack(gray, mask=moving_mask, **self.feature_params)
+
+        self.prev_gray = gray.copy()
+        return frame
+
     def detect_impact(self, frame): #检测导弹与目标的接触（关键技术：区域重叠检测；使用check_rectangles_overlap方法）
         
         """检测导弹与目标的接触"""
@@ -570,188 +633,57 @@ class MissileStrikeAnalyzer:    #导弹打击分析主类（重要参数:video_p
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
         return frame
 
-    def detect_explosion(self, frame):  #检测爆炸和烟尘发生（关键技术：HSV颜色空间分析；重要参数：brightness_threshold=30）
-        """检测爆炸和烟尘"""
-        # 如果已经检测到爆炸，直接返回当前帧，避免重复计算
-        '''潜在问题：
-        ​缺少爆炸标记：若需在帧上绘制爆炸效果（如红框或文字），此处直接返回原始帧会导致视觉反馈缺失。
-        ​优化建议：
-        if self.explosion_detected:
-            # 在帧上绘制爆炸标记（例如红色文字）
-            cv2.putText(frame, "EXPLOSION", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-            return frame'''
+    def detect_explosion(self, frame):
         if self.explosion_detected:
             return frame
 
-        # --- 改动点 A 开始 ---
-        # 如果未检测到导弹，不检测爆炸 (根据需求: 事件3依赖事件1)
-        # 原始代码是 if not self.impact_detected: return frame (事件3依赖事件2)
-        if not self.missile_detected:
-             # 保存当前帧用于后续爆炸检测 (即使未检测到导弹，也可以开始缓存，等待导弹出现)
-             if len(self.previous_frames) >= self.frames_to_keep:
-                 self.previous_frames.pop(0)
-             self.previous_frames.append(frame.copy())
-             return frame # 导弹未出现，跳过爆炸检测逻辑
-        # --- 改动点 A 结束 ---
-
-        # 如果目标区域未选择，无法检测爆炸
-        if self.target_roi is None:
-            # 如果未检测到导弹，不检测爆炸 (根据需求: 事件3依赖事件1)
-            # 在此分支下也需要缓存帧，以便导弹出现后立即进行对比
-            if len(self.previous_frames) >= self.frames_to_keep:
-                self.previous_frames.pop(0)
-            self.previous_frames.append(frame.copy())
-            return frame # 没有目标区域，无法检测爆炸
-
-
-        # 提取目标区域进行分析
-        '''功能：从当前帧中提取目标区域的图像块。
-        ​关键问题：
-        ​未验证目标区域有效性：若 self.target_roi 未定义或坐标越界，会引发 ValueError。
-        ​越界切片风险：如 target_y + target_h 超出图像高度，导致 target_region 为空数组。
-        ​优化建议：
-        python
-        # 检查目标区域是否存在
-        if not hasattr(self, 'target_roi') or not self.target_roi:
+        # 必须在碰撞发生后才判爆炸，极大减少误报
+        if not self.impact_detected or self.target_roi is None:
             return frame
-        # 提取并验证坐标
+
         target_x, target_y, target_w, target_h = self.target_roi
-        img_h, img_w = frame.shape[:2]
-        # 调整坐标和尺寸至图像范围内
-        x1 = max(0, min(target_x, img_w - 1))
-        y1 = max(0, min(target_y, img_h - 1))
-        x2 = max(0, min(target_x + target_w, img_w))
-        y2 = max(0, min(y + target_h, img_h))
-        target_region = frame[y1:y2, x1:x2]
-        # 检查区域是否有效
-        if target_region.size == 0:
-            return frame'''
-        target_x, target_y, target_w, target_h = self.target_roi
-        # 检查目标区域尺寸是否有效
         if target_w <= 0 or target_h <= 0:
-             return frame # 目标区域无效
-
-        target_region = frame[target_y:target_y + target_h, target_x:target_x + target_w]
-
-        # 如果没有足够的历史帧，返回
-        '''功能：确保至少有2帧历史数据用于对比，避免单帧无法计算差异。
-        ​潜在问题：
-        ​缓存策略低效：若使用列表的 pop(0) 维护历史帧，性能较差（时间复杂度 O(N)）。
-        ​未处理空帧：若 self.previous_frames 中存在空帧，可能导致后续逻辑错误。
-        ​优化建议：
-        # 使用 deque 优化缓存性能（在类初始化中定义）
-        from collections import deque
-        self.previous_frames = deque(maxlen=5)  # 根据需求调整 maxlen
-        # 检查有效帧数量
-        if len(self.previous_frames) < 2 or frame is None:
-            return frame'''
-
-        # 在进行爆炸检测前缓存当前帧
-        if len(self.previous_frames) >= self.frames_to_keep:
-            self.previous_frames.pop(0)
-        self.previous_frames.append(frame.copy())
-
-        # 如果没有足够的历史帧来计算差异，返回
-        if len(self.previous_frames) < 2:
             return frame
-        
-        # 获取当前帧和碰撞前的帧进行对比
-        # NOTE: 现在爆炸检测不依赖碰撞，所以对比帧应该是当前帧和缓存中的某个“相对稳定”帧
-        # 原始代码这里是 self.previous_frames[0] (第一个缓存帧)，这可以作为一个简单的“碰撞前”帧替代
-        # 或者更复杂的，选择导弹出现前的一帧作为基准帧
-        # 为了最小化改动并符合“出现导弹后检测爆炸”的要求，我们使用缓存中的第一帧作为对比基准
-        pre_impact_frame = self.previous_frames[0]
-        pre_impact_region = pre_impact_frame[target_y:target_y + target_h, target_x:target_x + target_w]
 
-        # 检查提取的区域是否有效
-        if pre_impact_region.size == 0 or target_region.size == 0:
-             return frame
+        roi = frame[target_y:target_y+target_h, target_x:target_x+target_w]
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
+        # 用impact时刻ROI做背景基准
+        if not hasattr(self, "explosion_bg_gray"):
+            self.explosion_bg_gray = gray.copy()
+            self.explosion_bg_hsv = hsv.copy()
+            self.explosion_suspect_frames = 0
 
-        # 转换为 HSV 色彩空间以分析颜色变化
-        '''功能：将当前帧和碰撞前帧的RGB图像转为HSV空间，分别计算H（色调）、S（饱和度）、V（亮度）通道的绝对差异。'''
-        hsv_current = cv2.cvtColor(target_region, cv2.COLOR_BGR2HSV)
-        hsv_pre = cv2.cvtColor(pre_impact_region, cv2.COLOR_BGR2HSV)
-        # 计算亮度和颜色差异
-        h_diff = cv2.absdiff(hsv_current[:, :, 0], hsv_pre[:, :, 0])
-        h_diff = (h_diff / 180 * 255).astype(np.uint8)
-        s_diff = cv2.absdiff(hsv_current[:, :, 1], hsv_pre[:, :, 1])
-        v_diff = cv2.absdiff(hsv_current[:, :, 2], hsv_pre[:, :, 2])
-        
-        '''功能：
-        对每个通道的差异进行二值化，合并成综合变化区域。
-        通过开运算（去噪）和闭运算（填充空洞）优化二值化结果。
-        ​潜在问题：
-        ​固定阈值和内核大小：brightness_threshold 和 color_change_threshold 可能需动态调整；5x5内核可能不适用于小目标。
-        ​通道合并策略简单：直接按位或操作可能引入噪声（例如H通道的微小变化被误判为爆炸）。
-        ​优化建议：
-        # 改进通道合并策略（例如仅当V通道超过阈值且H/S中至少一个超过）
-        v_valid = v_thresh > 0
-        hs_valid = (h_thresh > 0) | (s_thresh > 0)
-        combined_change = np.bitwise_and(v_valid, hs_valid).astype(np.uint8) * 255'''
-        # 检测大幅度亮度变化（爆炸通常伴随亮度急剧增加）
-        _, v_thresh = cv2.threshold(v_diff, self.brightness_threshold, 255, cv2.THRESH_BINARY)
-        # 检测火焰和烟雾的颜色变化
-        _, h_thresh = cv2.threshold(h_diff, self.color_change_threshold, 255, cv2.THRESH_BINARY)
-        _, s_thresh = cv2.threshold(s_diff, self.color_change_threshold, 255, cv2.THRESH_BINARY)
-        # 合并各种变化
-        combined_change = cv2.bitwise_or(cv2.bitwise_or(h_thresh, s_thresh), v_thresh)
-        # 应用形态学操作
-        kernel_size = max(1, int(min(target_w, target_h) * 0.05))
-        kernel = np.ones((kernel_size, kernel_size), np.uint8)
-        combined_change = cv2.morphologyEx(combined_change, cv2.MORPH_OPEN, kernel)
-        combined_change = cv2.morphologyEx(combined_change, cv2.MORPH_CLOSE, kernel)
-        
-        '''功能：通过变化区域占比判断是否发生爆炸，若触发则在帧上绘制标记。
-        ​关键问题：
-        ​硬编码阈值（0.2）​：缺乏灵活性，应设为可配置参数。
-        ​未处理目标区域尺寸变化：若目标区域非常小（如10x10），total_pixels=100，此时 white_pixels=20 即可触发爆炸，可能误检。
-        ​中文显示依赖自定义方法：若 put_chinese_text 未正确处理中文，可能显示乱码。
-        ​优化建议：
-        # 将阈值设为类变量
-        self.explosion_change_ratio_threshold = 0.2  # 在初始化中定义
-        # 动态调整阈值（例如小目标区域需要更高比例）
-        min_pixels = 1000  # 假设目标区域至少 32x32 (1024 pixels)
-        adjusted_threshold = self.explosion_change_ratio_threshold
-        if total_pixels < min_pixels:
-            adjusted_threshold += (min_pixels - total_pixels) / min_pixels * 0.1  # 小目标阈值提高
-        if change_ratio > adjusted_threshold:
-            # 标记爆炸
-            self.explosion_detected = True
-            # 绘制更醒目标记（如闪烁效果）
-            if (self.frame_counter // 5) % 2 == 0:  # 每5帧切换一次颜色
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
-            else:
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 3)
-            # 确保中文字体正确渲染（使用PIL库）
-            frame = self._draw_chinese_text(frame, "爆炸", (x1, y1 - 40), (0, 0, 255), 30)'''
-        # 计算变化区域（小区域增大阈值）
-        white_pixels = cv2.countNonZero(combined_change)
-        total_pixels = target_w * target_h
-        # 防止除以零
-        if total_pixels == 0:
-            change_ratio = 0
+        # 变化量
+        v_diff = cv2.absdiff(gray, self.explosion_bg_gray)
+        h_diff = cv2.absdiff(hsv[:,:,0], self.explosion_bg_hsv[:,:,0])
+        s_diff = cv2.absdiff(hsv[:,:,1], self.explosion_bg_hsv[:,:,1])
+
+        # “爆炸”为：亮度大幅增加 或 颜色显著变化，“且面积大”
+        v_mask = (v_diff > 30).astype(np.uint8)
+        h_mask = (h_diff > 25).astype(np.uint8)
+        s_mask = (s_diff > 40).astype(np.uint8)
+        combined_mask = cv2.bitwise_or(v_mask, cv2.bitwise_or(h_mask, s_mask))
+        area_ratio = np.sum(combined_mask) / (target_w * target_h)
+
+        # 连续多帧面积都大于阈值，才判爆炸（阈值按ROI面积自适应，正常取0.25~0.35）
+        area_thresh = 0.30 if target_w*target_h > 2000 else 0.15
+        if area_ratio > area_thresh:
+            self.explosion_suspect_frames += 1
         else:
-            change_ratio = white_pixels / total_pixels
-        base_threshold = self.explosion_change_ratio_threshold
-        if total_pixels < self.min_roi_pixels and total_pixels > 0: # 添加 total_pixels > 0 检查
-            scale_factor = (self.min_roi_pixels - total_pixels) / self.min_roi_pixels
-            # 调整阈值计算方式，确保不会负数
-            base_threshold = min(1.0, self.explosion_change_ratio_threshold + scale_factor * 0.15) # 防止阈值超过1.0
+            self.explosion_suspect_frames = 0
 
-        # 如果变化比例超过阈值，认为爆炸发生
-        if change_ratio > base_threshold:  # 调整这个阈值
+        if self.explosion_suspect_frames >= 3:
             self.explosion_detected = True
-            # 复制当前帧，而不是修改当前正在显示的帧
             self.key_frames["explosion"] = frame.copy()
             self.key_frames_time["explosion"] = self.frame_counter / self.fps
-            # 在目标区域绘制红色边框表示爆炸
-            cv2.rectangle(frame, (target_x, target_y),
-                          (target_x + target_w, target_y + target_h),
-                          (0, 0, 255), 2)
-            # 添加爆炸标记
-            text_pos = (target_x, target_y - 40)
-            frame = self.put_chinese_text(frame, "爆炸!", text_pos, 30, (0, 0, 255))
+            cv2.rectangle(frame, (target_x, target_y), (target_x+target_w, target_y+target_h), (0,0,255), 2)
+            frame = self.put_chinese_text(frame, "爆炸!", (target_x, target_y-40), 30, (0, 0, 255))
+            # 清空基准，防止后续干扰
+            del self.explosion_bg_gray
+            del self.explosion_bg_hsv
+            self.explosion_suspect_frames = 0
 
         return frame
 

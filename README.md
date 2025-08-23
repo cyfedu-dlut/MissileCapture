@@ -1,6 +1,17 @@
 #### 运行代码
 视频端：python .\ML_based_Approach1.1.py --video_path '.\Mk82.mkv'（''中为视频文件名称）
 摄像头端：python .\ML_based_Approach1.1.py --camera
+
+封装后运行方式
+```python
+from ML_based_Approach import ML_based_Approach
+
+if __name__ == "__main__":
+    # 视频路径与目标框 
+    video_path = r""           # 绝对路径
+    roi = (630, 380, 220, 160) # (x, y, w, h)
+    res = ML_based_Approach(video_path, roi)
+```
 #### 待修改
 历史帧管理优化、HSV的权重、目标区域获取（防御性编程）、用户重新选取目标区域（存在BUG）、爆炸结束检测等<br>
 #### 1.1.2版本更新

@@ -1,4 +1,4 @@
-#### 运行代码
+#### ML_based_Approach1.1.4.py运行方式：
 #### 视频端：
 ```python
 python .\ML_based_Approach1.1.4.py --video_path '.\Mk82.mkv'    # ''中为视频文件名称
@@ -7,7 +7,7 @@ python .\ML_based_Approach1.1.4.py --video_path '.\Mk82.mkv'    # ''中为视频
 ```python
 python .\ML_based_Approach1.1.4py --camera
 ```
-#### 封装后运行方式
+#### ML_based_Approach1.1.4.py封装后运行方式
 ```python
 from ML_based_Approach import ML_based_Approach
 
